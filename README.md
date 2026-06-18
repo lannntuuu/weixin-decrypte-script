@@ -15,6 +15,7 @@ Windows 微信 4.x 本地数据解密工具集，支持数据库解密、消息�
   - V2 格式（AES-128-ECB + XOR，从内存提取密钥）
 - **JSON API 服务**：将聊天记录以 RESTful API 方式提供，支持查询消息、联系人、群聊、会话，支持关键词搜索和多格式输出（JSON/CSV/Text）
 - **一键启动**：自动扫描密钥 → 自动解密数据库 → 启动 API 服务
+- **强制重新解密**：`--redecrypt` 参数强制重新解密所有数据库，获取最新消息
 
 ## 环境要求
 
@@ -47,6 +48,9 @@ python api_server.py "C:\Users\<USER>\Documents\xwechat_files\<wxid>" --key-file
 
 # 跳过解密（已有 .decrypted.db 文件）
 python api_server.py "C:\Users\<USER>\Documents\xwechat_files\<wxid>" --no-decrypt
+
+# 强制重新解密（获取最新消息）
+python api_server.py "C:\Users\<USER>\Documents\xwechat_files\<wxid>" --redecrypt
 ```
 
 启动后访问 `http://localhost:5050` 即可使用 API。
@@ -118,12 +122,12 @@ GET /api/v1/chatlog?talker=<id>&time=<range>&keyword=<text>&limit=50&offset=0&fo
 | 参数 | 必填 | 说明 |
 |------|------|------|
 | `talker` | 是 | 微信 ID 或群聊 ID，逗号分隔多个 |
-| `time` | 否 | 时间范围，如 `2025-01-01` 或 `2025-01-01,2025-06-01` |
+| `time` | 否 | 时间范围。单日期（如 `2026-06-01`）视为当天 00:00~23:59；逗号分隔起止（如 `2025-01-01,2025-06-30`） |
 | `sender` | 否 | 按发送者过滤 |
 | `keyword` | 否 | 按关键词过滤 |
 | `limit` | 否 | 返回数量，默认 50 |
 | `offset` | 否 | 分页偏移，默认 0 |
-| `format` | 否 | 输出格式：`json` / `csv` / `text`，默认 `json` |
+| `format` | 否 | 输出格式：`json` / `csv` / `text`，默认 `json`。CSV 带 UTF-8 BOM，Excel 可直接打开不乱码 |
 
 **示例：**
 
@@ -172,36 +176,51 @@ curl "http://localhost:5050/api/v1/chatlog?talker=wxid_xxx&format=text"
 ### 查询联系人
 
 ```
-GET /api/v1/contact?keyword=<name>&limit=50&offset=0
+GET /api/v1/contact?keyword=<name>&limit=0&offset=0
 ```
+
+> 默认 `limit=0`（返回全部），传正数启用分页。
 
 ```bash
 # 搜索联系人
 curl "http://localhost:5050/api/v1/contact?keyword=John"
 
-# 列出所有联系人
-curl "http://localhost:5050/api/v1/contact?limit=100"
+# 列出所有联系人（默认全量返回）
+curl "http://localhost:5050/api/v1/contact"
+
+# 分页
+curl "http://localhost:5050/api/v1/contact?limit=100&offset=0"
 ```
 
 ### 查询群聊
 
 ```
-GET /api/v1/chatroom?keyword=<name>&limit=50&offset=0
+GET /api/v1/chatroom?keyword=<name>&limit=0&offset=0
 ```
+
+> 群聊列表合并自 `chat_room` 表 + 消息库中的 `Name2Id`，默认返回全部。
 
 ```bash
 # 搜索群聊
 curl "http://localhost:5050/api/v1/chatroom?keyword=tech"
+
+# 列出所有群聊
+curl "http://localhost:5050/api/v1/chatroom"
 ```
 
 ### 查询会话
 
 ```
-GET /api/v1/session?keyword=<name>&limit=50&offset=0
+GET /api/v1/session?keyword=<name>&limit=0&offset=0
 ```
+
+> 默认 `limit=0`（返回全部）。
 
 ```bash
 # 最近会话
+curl "http://localhost:5050/api/v1/session"
+
+# 分页
 curl "http://localhost:5050/api/v1/session?limit=10"
 ```
 

@@ -122,7 +122,8 @@ class DBService:
         self._session_db = None
         self._media_db = None
         self._message_dbs = []
-        self._name2id_cache = {}
+        self._name2id_cache = {}       # rowid -> user_name
+        self._talker_table_map = {}    # user_name -> [(db_path, table_name)]，直接从数据库扫描建立
         self._contact_cache = {}
         self._chatroom_cache = {}
         self._initialized = False
@@ -170,13 +171,43 @@ class DBService:
             try:
                 conn = self._open_db(db_path)
                 cursor = conn.cursor()
+
+                # 加载 Name2Id 映射
                 cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='Name2Id'")
+                rowid2name = {}
                 if cursor.fetchone():
                     cursor.execute("SELECT rowid, user_name FROM Name2Id")
                     for row in cursor.fetchall():
                         self._name2id_cache[row[0]] = row[1]
+                        rowid2name[row[0]] = row[1]
+
+                # 扫描所有 Msg_ 表，通过 rowid 反查 user_name，建立映射
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'")
+                msg_tables = [row[0] for row in cursor.fetchall()]
+                for table_name in msg_tables:
+                    # Msg_<MD5> 中的 MD5 可能是对 rowid 做的，尝试反查
+                    md5_hex = table_name[4:]  # 去掉 "Msg_" 前缀
+                    matched_user = None
+                    for rowid, user_name in rowid2name.items():
+                        if hashlib.md5(str(rowid).encode()).hexdigest() == md5_hex:
+                            matched_user = user_name
+                            break
+                    # 也尝试对 user_name 做 MD5
+                    if matched_user is None:
+                        for rowid, user_name in rowid2name.items():
+                            if hashlib.md5(user_name.encode()).hexdigest() == md5_hex:
+                                matched_user = user_name
+                                break
+
+                    if matched_user:
+                        if matched_user not in self._talker_table_map:
+                            self._talker_table_map[matched_user] = []
+                        self._talker_table_map[matched_user].append((db_path, table_name))
+
             except Exception as e:
                 print(f"[DBService] Error loading Name2Id from {db_path}: {e}")
+
+        print(f"[DBService] talker_table_map: {len(self._talker_table_map)} talkers mapped")
 
     def _load_contacts(self):
         if not self._contact_db:
@@ -224,6 +255,17 @@ class DBService:
         except Exception as e:
             print(f"[DBService] Error loading chatrooms: {e}")
 
+        # 从消息数据库的 Name2Id 中补充 chat_room 表缺失的群聊
+        for user_name in self._name2id_cache.values():
+            if user_name.endswith("@chatroom") and user_name not in self._chatroom_cache:
+                cr = ChatRoom(name=user_name)
+                if user_name in self._contact_cache:
+                    cr.remark = self._contact_cache[user_name].remark
+                    cr.nick_name = self._contact_cache[user_name].nick_name
+                self._chatroom_cache[user_name] = cr
+
+        print(f"[DBService] chatrooms: {len(self._chatroom_cache)} loaded")
+
     def get_contact_display(self, username: str) -> str:
         if username in self._contact_cache:
             return self._contact_cache[username].display_name()
@@ -242,12 +284,26 @@ class DBService:
         end_ts = self._parse_time(end_time, end=True) if end_time else 9999999999
 
         all_messages = []
-        for db_path in self._message_dbs:
-            try:
-                msgs = self._query_messages_from_db(db_path, talkers, start_ts, end_ts, senders, keyword)
-                all_messages.extend(msgs)
-            except Exception as e:
-                print(f"[DBService] Error querying {db_path}: {e}")
+        for talker_id in talkers:
+            # 优先使用预建的映射表直接定位
+            table_entries = self._talker_table_map.get(talker_id, [])
+            if table_entries:
+                for db_path, table_name in table_entries:
+                    try:
+                        msgs = self._query_table(db_path, table_name, talker_id,
+                                                 start_ts, end_ts, senders, keyword)
+                        all_messages.extend(msgs)
+                    except Exception as e:
+                        print(f"[DBService] Error querying {db_path}/{table_name}: {e}")
+            else:
+                # 回退：遍历所有 db 文件尝试查找
+                for db_path in self._message_dbs:
+                    try:
+                        msgs = self._query_messages_from_db(db_path, [talker_id],
+                                                            start_ts, end_ts, senders, keyword)
+                        all_messages.extend(msgs)
+                    except Exception as e:
+                        print(f"[DBService] Error querying {db_path}: {e}")
 
         all_messages.sort(key=lambda m: m.seq)
 
@@ -258,9 +314,122 @@ class DBService:
 
         return all_messages, total
 
+    def _query_table(self, db_path: str, table_name: str, talker: str,
+                     start_ts: int, end_ts: int,
+                     senders: List[str], keyword: str) -> List[Message]:
+        """已知 db_path 和 table_name 时直接查询，跳过表名查找"""
+        conn = self._open_db(db_path)
+        cursor = conn.cursor()
+
+        is_chatroom = talker.endswith("@chatroom")
+
+        query = f"""
+            SELECT m.sort_seq, m.server_id, m.local_type, m.real_sender_id,
+                   m.create_time, m.message_content, m.packed_info_data, m.status
+            FROM {table_name} m
+            WHERE m.create_time >= ? AND m.create_time <= ?
+            ORDER BY m.sort_seq ASC
+        """
+        try:
+            cursor.execute(query, (start_ts, end_ts))
+        except sqlite3.OperationalError:
+            query = f"""
+                SELECT m.local_id, m.server_id, m.local_type, m.real_sender_id,
+                       m.create_time, m.message_content, m.packed_info_data, m.status
+                FROM {table_name} m
+                WHERE m.create_time >= ? AND m.create_time <= ?
+                ORDER BY m.local_id ASC
+            """
+            cursor.execute(query, (start_ts, end_ts))
+
+        messages = []
+        for row in cursor.fetchall():
+            msg = self._build_message(row, talker, is_chatroom, keyword, senders)
+            if msg:
+                messages.append(msg)
+
+        return messages
+
+    def _build_message(self, row, talker: str, is_chatroom: bool,
+                       keyword: str, senders: List[str]) -> Optional[Message]:
+        """从数据库行构建 Message 对象，返回 None 表示应跳过"""
+        sort_seq = row[0]
+        local_type = row[2]
+        real_sender_id = row[3]
+        create_time = row[4]
+        message_content = row[5]
+        packed_info_data = row[6]
+        status = row[7]
+
+        sender_name = self._name2id_cache.get(real_sender_id, "")
+        if not sender_name:
+            sender_name = str(real_sender_id)
+
+        is_self = status == 2 or (not is_chatroom and talker != sender_name)
+
+        raw_content = safe_decode(message_content)
+
+        msg = Message(
+            seq=sort_seq,
+            time=datetime.fromtimestamp(create_time).strftime("%Y-%m-%d %H:%M:%S") if create_time else "",
+            talker=talker,
+            is_chatroom=is_chatroom,
+            sender=sender_name,
+            is_self=is_self,
+            type=local_type,
+        )
+
+        if is_chatroom and raw_content:
+            split = raw_content.split(":\n", 1)
+            if len(split) == 2:
+                msg.sender = split[0]
+                raw_content = split[1]
+
+        if not msg.is_self:
+            if msg.talker in self._chatroom_cache:
+                cr = self._chatroom_cache[msg.talker]
+                msg.talker_name = cr.display_name()
+                if msg.sender in cr.user2display_name:
+                    msg.sender_name = cr.user2display_name[msg.sender]
+            if not msg.sender_name and msg.sender in self._contact_cache:
+                msg.sender_name = self._contact_cache[msg.sender].display_name()
+        else:
+            msg.sender_name = "me"
+
+        msg.parse_media_info(raw_content)
+
+        if packed_info_data and isinstance(packed_info_data, bytes):
+            try:
+                pb = parse_protobuf(packed_info_data)
+                for fn, fv in pb.items():
+                    if isinstance(fv, bytes):
+                        inner = parse_protobuf(fv)
+                        for ik, iv in inner.items():
+                            if isinstance(iv, bytes):
+                                try:
+                                    iv = iv.decode("utf-8")
+                                except UnicodeDecodeError:
+                                    iv = iv.hex()
+                            if ik == 2 and msg.type == 3:
+                                msg.contents["path"] = f"msg/attach/{hashlib.md5(talker.encode()).hexdigest()}/{msg.time[:7]}/Img/{iv}"
+                            elif ik == 2 and msg.type == 43:
+                                msg.contents["path"] = f"msg/video/{msg.time[:7]}/{iv}"
+            except Exception:
+                pass
+
+        if senders and msg.sender not in senders and msg.sender_name not in senders:
+            return None
+
+        if keyword:
+            if keyword.lower() not in msg.content.lower() and keyword.lower() not in raw_content.lower():
+                return None
+
+        return msg
+
     def _query_messages_from_db(self, db_path: str, talkers: List[str],
                                  start_ts: int, end_ts: int,
                                  senders: List[str], keyword: str) -> List[Message]:
+        """回退方法：遍历 db 文件尝试通过 MD5 猜测表名"""
         conn = self._open_db(db_path)
         cursor = conn.cursor()
 
@@ -295,79 +464,9 @@ class DBService:
                 cursor.execute(query, (start_ts, end_ts))
 
             for row in cursor.fetchall():
-                sort_seq = row[0]
-                server_id = row[1]
-                local_type = row[2]
-                real_sender_id = row[3]
-                create_time = row[4]
-                message_content = row[5]
-                packed_info_data = row[6]
-                status = row[7]
-
-                sender_name = self._name2id_cache.get(real_sender_id, "")
-                if not sender_name:
-                    sender_name = str(real_sender_id)
-
-                is_self = status == 2 or (not is_chatroom and talker != sender_name)
-
-                raw_content = safe_decode(message_content)
-
-                msg = Message(
-                    seq=sort_seq,
-                    time=datetime.fromtimestamp(create_time).strftime("%Y-%m-%d %H:%M:%S") if create_time else "",
-                    talker=talker,
-                    is_chatroom=is_chatroom,
-                    sender=sender_name,
-                    is_self=is_self,
-                    type=local_type,
-                )
-
-                if is_chatroom and raw_content:
-                    split = raw_content.split(":\n", 1)
-                    if len(split) == 2:
-                        msg.sender = split[0]
-                        raw_content = split[1]
-
-                if not msg.is_self:
-                    if msg.talker in self._chatroom_cache:
-                        cr = self._chatroom_cache[msg.talker]
-                        msg.talker_name = cr.display_name()
-                        if msg.sender in cr.user2display_name:
-                            msg.sender_name = cr.user2display_name[msg.sender]
-                    if not msg.sender_name and msg.sender in self._contact_cache:
-                        msg.sender_name = self._contact_cache[msg.sender].display_name()
-                else:
-                    msg.sender_name = "me"
-
-                msg.parse_media_info(raw_content)
-
-                if packed_info_data and isinstance(packed_info_data, bytes):
-                    try:
-                        pb = parse_protobuf(packed_info_data)
-                        for fn, fv in pb.items():
-                            if isinstance(fv, bytes):
-                                inner = parse_protobuf(fv)
-                                for ik, iv in inner.items():
-                                    if isinstance(iv, bytes):
-                                        try:
-                                            iv = iv.decode("utf-8")
-                                        except UnicodeDecodeError:
-                                            iv = iv.hex()
-                                    if ik == 2 and msg.type == 3:
-                                        msg.contents["path"] = f"msg/attach/{hashlib.md5(talker.encode()).hexdigest()}/{msg.time[:7]}/Img/{iv}"
-                                    elif ik == 2 and msg.type == 43:
-                                        msg.contents["path"] = f"msg/video/{msg.time[:7]}/{iv}"
-                    except Exception:
-                        pass
-
-                if senders and msg.sender not in senders and msg.sender_name not in senders:
-                    continue
-
-                if keyword:
-                    if keyword.lower() not in msg.content.lower() and keyword.lower() not in raw_content.lower():
-                        continue
-
-                messages.append(msg)
+                msg = self._build_message(row, talker, is_chatroom, keyword, senders)
+                if msg:
+                    messages.append(msg)
 
         return messages
 

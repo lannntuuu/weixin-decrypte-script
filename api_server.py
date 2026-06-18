@@ -48,10 +48,23 @@ def handle_chatlog():
     if offset < 0:
         offset = 0
 
+    # 解析时间参数：单日期视为当天范围，逗号分隔视为起止范围
+    start_time = None
+    end_time = None
+    time_arg = request.args.get("time", "")
+    if time_arg:
+        if "," in time_arg:
+            parts = time_arg.split(",", 1)
+            start_time = parts[0].strip() or None
+            end_time = parts[1].strip() or None
+        else:
+            start_time = time_arg
+            end_time = time_arg  # 单日期同时作为结束时间
+
     messages, total = db.get_messages(
         talker=talker,
-        start_time=start_time if start_time else None,
-        end_time=None,
+        start_time=start_time,
+        end_time=end_time,
         sender=sender,
         keyword=keyword,
         limit=limit,
@@ -60,6 +73,7 @@ def handle_chatlog():
 
     if fmt == "csv":
         output = io.StringIO()
+        output.write("\ufeff")  # UTF-8 BOM，确保 Excel 正确识别编码
         writer = csv.writer(output)
         writer.writerow(["Time", "SenderName", "Sender", "TalkerName", "Talker", "Content"])
         for m in messages:
@@ -95,7 +109,7 @@ def handle_contacts():
         return jsonify({"error": "database not initialized"}), 503
 
     keyword = request.args.get("keyword", "")
-    limit = int(request.args.get("limit", 50))
+    limit = int(request.args.get("limit", 0))
     offset = int(request.args.get("offset", 0))
     fmt = request.args.get("format", "json").lower()
 
@@ -103,6 +117,7 @@ def handle_contacts():
 
     if fmt == "csv":
         output = io.StringIO()
+        output.write("\ufeff")  # UTF-8 BOM，确保 Excel 正确识别编码
         writer = csv.writer(output)
         writer.writerow(["UserName", "Alias", "Remark", "NickName"])
         for c in result.items:
@@ -126,7 +141,7 @@ def handle_chatrooms():
         return jsonify({"error": "database not initialized"}), 503
 
     keyword = request.args.get("keyword", "")
-    limit = int(request.args.get("limit", 50))
+    limit = int(request.args.get("limit", 0))
     offset = int(request.args.get("offset", 0))
     fmt = request.args.get("format", "json").lower()
 
@@ -134,6 +149,7 @@ def handle_chatrooms():
 
     if fmt == "csv":
         output = io.StringIO()
+        output.write("\ufeff")  # UTF-8 BOM，确保 Excel 正确识别编码
         writer = csv.writer(output)
         writer.writerow(["Name", "Remark", "NickName", "Owner", "UserCount"])
         for cr in result.items:
@@ -150,7 +166,7 @@ def handle_sessions():
         return jsonify({"error": "database not initialized"}), 503
 
     keyword = request.args.get("keyword", "")
-    limit = int(request.args.get("limit", 50))
+    limit = int(request.args.get("limit", 0))
     offset = int(request.args.get("offset", 0))
     fmt = request.args.get("format", "json").lower()
 
@@ -158,6 +174,7 @@ def handle_sessions():
 
     if fmt == "csv":
         output = io.StringIO()
+        output.write("\ufeff")  # UTF-8 BOM，确保 Excel 正确识别编码
         writer = csv.writer(output)
         writer.writerow(["UserName", "NickName", "Content", "Time"])
         for s in result.items:
@@ -210,6 +227,8 @@ def main():
                         help="File containing decryption keys (one hex key per line)")
     parser.add_argument("--no-decrypt", action="store_true",
                         help="Skip auto-decryption, use existing .decrypted.db files only")
+    parser.add_argument("--redecrypt", action="store_true",
+                        help="Force re-decrypt all databases even if .decrypted.db exists")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=5050, help="Port to bind (default: 5050)")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
@@ -250,10 +269,13 @@ def main():
             print("[API] No key provided, attempting auto-scan from WeChat memory...")
             keys_hex = scan_keys_from_memory()
 
-        print("[API] Checking and decrypting databases...")
-        ensure_decrypted(db_storage, keys_hex)
-    else:
-        print("[API] Skipping decryption (--no-decrypt)")
+        if args.redecrypt:
+            print("[API] Force re-decrypting all databases...")
+        else:
+            print("[API] Checking and decrypting databases...")
+        ensure_decrypted(db_storage, keys_hex, force=args.redecrypt)
+    elif args.redecrypt:
+        print("[API] --redecrypt ignored because --no-decrypt is set")
 
     print(f"[API] Initializing database service...")
     db_service = DBService(db_storage)

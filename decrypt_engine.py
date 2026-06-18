@@ -145,7 +145,7 @@ def find_decrypted_path(db_path):
     return db_path + ".decrypted.db"
 
 
-def auto_decrypt(base_dir, keys_hex=None):
+def auto_decrypt(base_dir, keys_hex=None, force=False):
     if keys_hex is None:
         keys_hex = scan_keys_from_memory()
         if not keys_hex:
@@ -161,7 +161,7 @@ def auto_decrypt(base_dir, keys_hex=None):
 
     for db_path in db_files:
         decrypted_path = find_decrypted_path(db_path)
-        if os.path.exists(decrypted_path):
+        if not force and os.path.exists(decrypted_path):
             skipped += 1
             continue
 
@@ -187,12 +187,12 @@ def auto_decrypt(base_dir, keys_hex=None):
     return success, failed
 
 
-def ensure_decrypted(base_dir, keys_hex=None):
+def ensure_decrypted(base_dir, keys_hex=None, force=False):
     db_files = find_db_files(base_dir)
     need_decrypt = []
     for db_path in db_files:
         decrypted_path = find_decrypted_path(db_path)
-        if not os.path.exists(decrypted_path):
+        if force or not os.path.exists(decrypted_path):
             need_decrypt.append(db_path)
 
     if not need_decrypt:
@@ -208,5 +208,5 @@ def ensure_decrypted(base_dir, keys_hex=None):
         print("[DecryptEngine] No keys available!")
         return False
 
-    success, failed = auto_decrypt(base_dir, keys_hex)
+    success, failed = auto_decrypt(base_dir, keys_hex, force=force)
     return failed == 0
